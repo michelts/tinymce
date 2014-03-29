@@ -197,8 +197,10 @@ define("tinymce/pasteplugin/Utils", [
  * This class contains logic for getting HTML contents out of the clipboard.
  *
  * We need to make a lot of ugly hacks to get the contents out of the clipboard since
- * the W3C Clipboard API is broken in all browsers: Gecko/WebKit/Blink. We might rewrite
- * this the way those API:s stabilize.
+ * the W3C Clipboard API is broken in all browsers that have it: Gecko/WebKit/Blink.
+ * We might rewrite this the way those API:s stabilize. Browsers doesn't handle pasting
+ * from applications like Word the same way as it does when pasting into a contentEditable area
+ * so we need to do lots of extra work to try to get to this clipboard data.
  *
  * Current implementation steps:
  *  1. On keydown with paste keys Ctrl+V or Shift+Insert create
@@ -290,22 +292,48 @@ define("tinymce/pasteplugin/Clipboard", [
 		}
 
 		/**
-		 * Creates a paste bin element and moves the selection into that element. It will also move the element offscreen
-		 * so that resize handles doesn't get produced on IE or Drag handles or Firefox.
+		 * Creates a paste bin element as close as possible to the current caret location and places the focus inside that element
+		 * so that when the real paste event occurs the contents gets inserted into this element
+		 * instead of the current editor selection element.
 		 */
 		function createPasteBin() {
 			var dom = editor.dom, body = editor.getBody();
-			var viewport = editor.dom.getViewPort(editor.getWin()), scrollTop, top = 20;
+			var viewport = editor.dom.getViewPort(editor.getWin()), scrollTop = viewport.y, top = 20;
+			var scrollContainer;
 
 			lastRng = editor.selection.getRng();
-			scrollTop = editor.inline ? editor.selection.getScrollContainer().scrollTop : viewport.y;
+
+			if (editor.inline) {
+				scrollContainer = editor.selection.getScrollContainer();
+
+				if (scrollContainer) {
+					scrollTop = scrollContainer.scrollTop;
+				}
+			}
 
 			// Calculate top cordinate this is needed to avoid scrolling to top of document
 			// We want the paste bin to be as close to the caret as possible to avoid scrolling
 			if (lastRng.getClientRects) {
 				var rects = lastRng.getClientRects();
+
 				if (rects.length) {
+					// Client rects gets us closes to the actual
+					// caret location in for example a wrapped paragraph block
 					top = scrollTop + (rects[0].top - dom.getPos(body).y);
+				} else {
+					top = scrollTop;
+
+					// Check if we can find a closer location by checking the range element
+					var container = lastRng.startContainer;
+					if (container) {
+						if (container.nodeType == 3 && container.parentNode != body) {
+							container = container.parentNode;
+						}
+
+						if (container.nodeType == 1) {
+							top = dom.getPos(container, scrollContainer || body).y;
+						}
+					}
 				}
 			}
 
@@ -394,7 +422,11 @@ define("tinymce/pasteplugin/Clipboard", [
 			var data = {};
 
 			if (dataTransfer && dataTransfer.types) {
-				data['text/plain'] = dataTransfer.getData('Text');
+				// Use old WebKit API
+				var legacyText = dataTransfer.getData('Text');
+				if (legacyText && legacyText.length > 0) {
+					data['text/plain'] = legacyText;
+				}
 
 				for (var i = 0; i < dataTransfer.types.length; i++) {
 					var contentType = dataTransfer.types[i];
@@ -416,143 +448,213 @@ define("tinymce/pasteplugin/Clipboard", [
 			return getDataTransferItems(clipboardEvent.clipboardData || editor.getDoc().dataTransfer);
 		}
 
+		/**
+		 * Checks if the clipboard contains image data if it does it will take that data
+		 * and convert it into a data url image and paste that image at the caret location.
+		 *
+		 * @param  {ClipboardEvent} e Paste event object.
+		 * @param  {Object} clipboardContent Collection of clipboard contents.
+		 * @return {Boolean} true/false if the image data was found or not.
+		 */
+		function pasteImageData(e, clipboardContent) {
+			function pasteImage(item) {
+				if (items[i].type == 'image/png') {
+					var reader = new FileReader();
+
+					reader.onload = function() {
+						pasteHtml('<img src="' + reader.result + '">');
+					};
+
+					reader.readAsDataURL(item.getAsFile());
+
+					return true;
+				}
+			}
+
+			// If paste data images are disabled or there is HTML or plain text
+			// contents then proceed with the normal paste process
+			if (!editor.settings.paste_data_images || "text/html" in clipboardContent || "text/plain" in clipboardContent) {
+				return;
+			}
+
+			if (e.clipboardData) {
+				var items = e.clipboardData.items;
+
+				if (items) {
+					for (var i = 0; i < items.length; i++) {
+						if (pasteImage(items[i])) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+
 		function getCaretRangeFromEvent(e) {
 			var doc = editor.getDoc(), rng;
 
 			if (doc.caretPositionFromPoint) {
-				var point = doc.caretPositionFromPoint(e.pageX, e.pageY);
+				var point = doc.caretPositionFromPoint(e.clientX, e.clientY);
 				rng = doc.createRange();
 				rng.setStart(point.offsetNode, point.offset);
 				rng.collapse(true);
 			} else if (doc.caretRangeFromPoint) {
-				rng = doc.caretRangeFromPoint(e.pageX, e.pageY);
+				rng = doc.caretRangeFromPoint(e.clientX, e.clientY);
 			}
 
 			return rng;
 		}
 
-		editor.on('keydown', function(e) {
-			if (e.isDefaultPrevented()) {
-				return;
-			}
+		function hasContentType(clipboardContent, mimeType) {
+			return mimeType in clipboardContent && clipboardContent[mimeType].length > 0;
+		}
 
-			// Ctrl+V or Shift+Insert
-			if ((VK.metaKeyPressed(e) && e.keyCode == 86) || (e.shiftKey && e.keyCode == 45)) {
-				keyboardPastePlainTextState = e.shiftKey && e.keyCode == 86;
-
-				// Prevent undoManager keydown handler from making an undo level with the pastebin in it
-				e.stopImmediatePropagation();
-
-				keyboardPasteTimeStamp = new Date().getTime();
-
-				// IE doesn't support Ctrl+Shift+V and it doesn't even produce a paste event
-				// so lets fake a paste event and let IE use the execCommand/dataTransfer methods
-				if (Env.ie && keyboardPastePlainTextState) {
-					e.preventDefault();
-					editor.fire('paste', {ieFake: true});
+		function registerEventHandlers() {
+			editor.on('keydown', function(e) {
+				if (e.isDefaultPrevented()) {
 					return;
 				}
 
-				removePasteBin();
-				createPasteBin();
-			}
-		});
+				// Ctrl+V or Shift+Insert
+				if ((VK.metaKeyPressed(e) && e.keyCode == 86) || (e.shiftKey && e.keyCode == 45)) {
+					keyboardPastePlainTextState = e.shiftKey && e.keyCode == 86;
 
-		editor.on('paste', function(e) {
-			var clipboardContent = getClipboardContent(e);
-			var isKeyBoardPaste = new Date().getTime() - keyboardPasteTimeStamp < 1000;
-			var plainTextMode = self.pasteFormat == "text" || keyboardPastePlainTextState;
+					// Prevent undoManager keydown handler from making an undo level with the pastebin in it
+					e.stopImmediatePropagation();
 
-			// Not a keyboard paste prevent default paste and try to grab the clipboard contents using different APIs
-			if (!isKeyBoardPaste) {
-				e.preventDefault();
-			}
+					keyboardPasteTimeStamp = new Date().getTime();
 
-			// Try IE only method if paste isn't a keyboard paste
-			if (Env.ie && (!isKeyBoardPaste || e.ieFake)) {
-				createPasteBin();
-
-				editor.dom.bind(pasteBinElm, 'paste', function(e) {
-					e.stopPropagation();
-				});
-
-				editor.getDoc().execCommand('Paste', false, null);
-				clipboardContent["text/html"] = getPasteBinHtml();
-			}
-
-			setTimeout(function() {
-				var html = getPasteBinHtml();
-
-				// WebKit has a nice bug where it clones the paste bin if you paste from for example notepad
-				if (pasteBinElm && pasteBinElm.firstChild && pasteBinElm.firstChild.id === 'mcepastebin') {
-					plainTextMode = true;
-				}
-
-				removePasteBin();
-
-				if (html == pasteBinDefaultContent || !isKeyBoardPaste) {
-					html = clipboardContent['text/html'] || clipboardContent['text/plain'] || pasteBinDefaultContent;
-
-					if (html == pasteBinDefaultContent) {
-						if (!isKeyBoardPaste) {
-							editor.windowManager.alert('Please use Ctrl+V/Cmd+V keyboard shortcuts to paste contents.');
-						}
-
+					// IE doesn't support Ctrl+Shift+V and it doesn't even produce a paste event
+					// so lets fake a paste event and let IE use the execCommand/dataTransfer methods
+					if (Env.ie && keyboardPastePlainTextState) {
+						e.preventDefault();
+						editor.fire('paste', {ieFake: true});
 						return;
 					}
+
+					removePasteBin();
+					createPasteBin();
+				}
+			});
+
+			editor.on('paste', function(e) {
+				var clipboardContent = getClipboardContent(e);
+				var isKeyBoardPaste = new Date().getTime() - keyboardPasteTimeStamp < 1000;
+				var plainTextMode = self.pasteFormat == "text" || keyboardPastePlainTextState;
+
+				if (e.isDefaultPrevented()) {
+					removePasteBin();
+					return;
 				}
 
-				if (plainTextMode) {
-					pasteText(clipboardContent['text/plain'] || Utils.innerText(html));
-				} else {
-					pasteHtml(html);
+				if (pasteImageData(e, clipboardContent)) {
+					removePasteBin();
+					return;
 				}
-			}, 0);
-		});
 
-		editor.on('dragstart', function(e) {
-			if (e.dataTransfer.types) {
-				try {
-					e.dataTransfer.setData('mce-internal', editor.selection.getContent());
-				} catch (ex) {
-					// IE 10 throws an error since it doesn't support custom data items
-				}
-			}
-		});
-
-		editor.on('drop', function(e) {
-			var rng = getCaretRangeFromEvent(e);
-
-			if (rng) {
-				var dropContent = getDataTransferItems(e.dataTransfer);
-				var content = dropContent['mce-internal'] || dropContent['text/html'] || dropContent['text/plain'];
-
-				if (content) {
+				// Not a keyboard paste prevent default paste and try to grab the clipboard contents using different APIs
+				if (!isKeyBoardPaste) {
 					e.preventDefault();
-
-					editor.undoManager.transact(function() {
-						if (dropContent['mce-internal']) {
-							editor.execCommand('Delete');
-						}
-
-						editor.selection.setRng(rng);
-
-						if (!dropContent['text/html']) {
-							pasteText(content);
-						} else {
-							pasteHtml(content);
-						}
-					});
 				}
-			}
-		});
+
+				// Try IE only method if paste isn't a keyboard paste
+				if (Env.ie && (!isKeyBoardPaste || e.ieFake)) {
+					createPasteBin();
+
+					editor.dom.bind(pasteBinElm, 'paste', function(e) {
+						e.stopPropagation();
+					});
+
+					editor.getDoc().execCommand('Paste', false, null);
+					clipboardContent["text/html"] = getPasteBinHtml();
+				}
+
+				setTimeout(function() {
+					var html = getPasteBinHtml();
+
+					// WebKit has a nice bug where it clones the paste bin if you paste from for example notepad
+					if (pasteBinElm && pasteBinElm.firstChild && pasteBinElm.firstChild.id === 'mcepastebin') {
+						plainTextMode = true;
+					}
+
+					removePasteBin();
+
+					// Always use pastebin HTML if it's available since it contains Word contents
+					if (!plainTextMode && isKeyBoardPaste && html && html != pasteBinDefaultContent) {
+						clipboardContent['text/html'] = html;
+					}
+
+					if (html == pasteBinDefaultContent || !isKeyBoardPaste) {
+						html = clipboardContent['text/html'] || clipboardContent['text/plain'] || pasteBinDefaultContent;
+
+						if (html == pasteBinDefaultContent) {
+							if (!isKeyBoardPaste) {
+								editor.windowManager.alert('Please use Ctrl+V/Cmd+V keyboard shortcuts to paste contents.');
+							}
+
+							return;
+						}
+					}
+
+					// Force plain text mode if we only got a text/plain content type
+					if (!hasContentType(clipboardContent, 'text/html') && hasContentType(clipboardContent, 'text/plain')) {
+						plainTextMode = true;
+					}
+
+					if (plainTextMode) {
+						pasteText(clipboardContent['text/plain'] || Utils.innerText(html));
+					} else {
+						pasteHtml(html);
+					}
+				}, 0);
+			});
+
+			editor.on('dragstart', function(e) {
+				if (e.dataTransfer.types) {
+					try {
+						e.dataTransfer.setData('mce-internal', editor.selection.getContent());
+					} catch (ex) {
+						// IE 10 throws an error since it doesn't support custom data items
+					}
+				}
+			});
+
+			editor.on('drop', function(e) {
+				var rng = getCaretRangeFromEvent(e);
+
+				if (rng && !e.isDefaultPrevented()) {
+					var dropContent = getDataTransferItems(e.dataTransfer);
+					var content = dropContent['mce-internal'] || dropContent['text/html'] || dropContent['text/plain'];
+
+					if (content) {
+						e.preventDefault();
+
+						editor.undoManager.transact(function() {
+							if (dropContent['mce-internal']) {
+								editor.execCommand('Delete');
+							}
+
+							editor.selection.setRng(rng);
+
+							if (!dropContent['text/html']) {
+								pasteText(content);
+							} else {
+								pasteHtml(content);
+							}
+						});
+					}
+				}
+			});
+		}
 
 		self.pasteHtml = pasteHtml;
 		self.pasteText = pasteText;
 
-		// Remove all data images from paste for example from Gecko
-		// except internal images like video elements
 		editor.on('preInit', function() {
+			registerEventHandlers();
+
+			// Remove all data images from paste for example from Gecko
+			// except internal images like video elements
 			editor.parser.addNodeFilter('img', function(nodes) {
 				if (!editor.settings.paste_data_images) {
 					var i = nodes.length;
@@ -603,7 +705,10 @@ define("tinymce/pasteplugin/WordFilter", [
 	"tinymce/pasteplugin/Utils"
 ], function(Tools, DomParser, Schema, Serializer, Node, Utils) {
 	function isWordContent(content) {
-		return (/<font face="Times New Roman"|class="?Mso|style="[^"]*\bmso-|style='[^'']*\bmso-|w:WordDocument/i).test(content);
+		return (
+			(/<font face="Times New Roman"|class="?Mso|style="[^"]*\bmso-|style='[^'']*\bmso-|w:WordDocument/i).test(content) ||
+			(/class="OutlineElement/).test(content)
+		);
 	}
 
 	function WordFilter(editor) {
@@ -724,7 +829,7 @@ define("tinymce/pasteplugin/WordFilter", [
 					}
 				}
 
-				if (editor.getParam("paste_retain_style_properties", "none")) {
+				if (retainStyleProperties) {
 					var outputStyle = "";
 
 					Tools.each(editor.dom.parseStyle(styleValue), function(value, name) {
@@ -747,6 +852,11 @@ define("tinymce/pasteplugin/WordFilter", [
 							case "mso-highlight":
 								name = "background";
 								break;
+						}
+
+						// Never allow mso- prefixed names
+						if (name.indexOf('mso-') === 0) {
+							return;
 						}
 
 						// Output only valid styles
@@ -791,7 +901,7 @@ define("tinymce/pasteplugin/WordFilter", [
 					[/<span\s+style\s*=\s*"\s*mso-spacerun\s*:\s*yes\s*;?\s*"\s*>([\s\u00a0]*)<\/span>/gi,
 						function(str, spaces) {
 							return (spaces.length > 0) ?
-								spaces.replace(/./, " ").slice(Math.floor(spaces.length/2)).split("").join("\u00a0") : "";
+								spaces.replace(/./, " ").slice(Math.floor(spaces.length / 2)).split("").join("\u00a0") : "";
 						}
 					]
 				]);
@@ -799,7 +909,7 @@ define("tinymce/pasteplugin/WordFilter", [
 				var validElements = settings.paste_word_valid_elements;
 				if (!validElements) {
 					validElements = '@[style],-strong/b,-em/i,-span,-p,-ol,-ul,-li,-h1,-h2,-h3,-h4,-h5,-h6,' +
-						'-table,-tr,-td[colspan|rowspan],-th,-thead,-tfoot,-tbody,-a[href|name],sub,sup,strike,br';
+						'-table[width],-tr,-td[colspan|rowspan|width],-th,-thead,-tfoot,-tbody,-a[href|name],sub,sup,strike,br';
 				}
 
 				// Setup strict schema
@@ -849,6 +959,7 @@ define("tinymce/pasteplugin/WordFilter", [
 						}
 					}
 				});
+
 				// Parse into DOM structure
 				var rootNode = domParser.parse(content);
 
@@ -912,9 +1023,9 @@ define("tinymce/pasteplugin/Quirks", [
 		 */
 		function removeWebKitFragments(html) {
 			html = Utils.filter(html, [
-				/^[\s\S]*<!--StartFragment-->|<!--EndFragment-->[\s\S]*$/g,        // WebKit fragment
+				/^[\s\S]*<!--StartFragment-->|<!--EndFragment-->[\s\S]*$/g, // WebKit fragment
 				[/<span class="Apple-converted-space">\u00a0<\/span>/g, '\u00a0'], // WebKit &nbsp;
-				/<br>$/															   // Traling BR elements
+				/<br>$/i // Traling BR elements
 			]);
 
 			return html;
@@ -973,8 +1084,13 @@ define("tinymce/pasteplugin/Quirks", [
 		 * @return {String} Processed contents.
 		 */
 		function removeWebKitStyles(content) {
+			// Passthrough all styles from Word and let the WordFilter handle that junk
+			if (WordFilter.isWordContent(content)) {
+				return content;
+			}
+
 			if (editor.settings.paste_remove_styles || editor.settings.paste_remove_styles_if_webkit !== false) {
-				content = content.replace(/ style=\"[^\"]+\"/g, '');
+				content = content.replace(/ style=\"[^\"]+\"/gi, '');
 			}
 
 			return content;
